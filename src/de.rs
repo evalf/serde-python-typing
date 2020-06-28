@@ -1,13 +1,13 @@
 use pyo3::conversion::ToPyObject;
 use pyo3::exceptions::ValueError;
-use pyo3::types::{PyComplex, PyDict, PyFrozenSet, PyList, PySet, PyTuple, PyString, IntoPyDict};
-use pyo3::{PyErr, PyObject, Python};
+use pyo3::types::{IntoPyDict, PyComplex, PyDict, PyFrozenSet, PyList, PySet, PyString, PyTuple};
+use pyo3::{PyErr, PyObject, Python, AsPyRef};
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::schema::Type;
+use crate::Type;
 
 // Like `?` for a `PyResult<T>` but if the result is an error, store the
 // error and return a serde error instead.
@@ -36,10 +36,15 @@ pub struct Wrapper<'a> {
   typ: &'a Type,
 }
 
+#[cfg(feature = "complex-struct")]
 #[derive(Deserialize)]
 struct Complex {
   real: f64,
   imag: f64,
+}
+
+fn strip_j(s: &str) -> Option<&str> {
+  if s.ends_with('j') { Some(&s[..s.len()-1]) } else { None }
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for Wrapper<'a> {
@@ -52,11 +57,53 @@ impl<'de, 'a> DeserializeSeed<'de> for Wrapper<'a> {
       Type::Bool => deserializer.deserialize_bool(VisitBool(self.py)),
       Type::Int => deserializer.deserialize_i64(VisitInt(self.py)),
       Type::Float => deserializer.deserialize_f64(VisitFloat(self.py)),
+      #[cfg(feature = "complex-str")]
+      Type::Complex => {
+        let mut parts = <&str>::deserialize(deserializer)?.split('+');
+        let (r, i) = match (parts.next(), parts.next(), parts.next()) {
+          (Some(r), Some(i), None) => match strip_j(i) {
+            Some(i) => (r, i),
+            None => {
+              raise!(self.py, ValueError, "cannot parse complex value");
+            }
+          },
+          (Some(v), None, None) => match strip_j(v) {
+            Some(i) => ("0", i),
+            None => (v, "0"),
+          },
+          _ => {
+            raise!(self.py, ValueError, "cannot parse complex value");
+          }
+        };
+        let r = match r.parse::<f64>() {
+          Ok(v) => v,
+          Err(e) => {
+            raise!(self.py, ValueError, format!("cannot parse complex value: {:?}", e));
+          }
+        };
+        let i = match i.parse::<f64>() {
+          Ok(v) => v,
+          Err(e) => {
+            raise!(self.py, ValueError, format!("cannot parse complex value: {:?}", e));
+          }
+        };
+        Ok(PyComplex::from_doubles(self.py, r, i).into())
+      }
+      #[cfg(feature = "complex-struct")]
       Type::Complex => {
         let val = Complex::deserialize(deserializer)?;
         Ok(PyComplex::from_doubles(self.py, val.real, val.imag).into())
       }
+      Type::Decimal => {
+        let s = deserializer.deserialize_str(VisitString(self.py))?;
+        Ok(pytry!(self.py, pytry!(self.py, pytry!(self.py, self.py.import("decimal")).getattr("Decimal")).call1((s,))).into())
+      }
+      Type::Enum(t) => {
+        let s = deserializer.deserialize_str(VisitString(self.py))?;
+        Ok(pytry!(self.py, pytry!(self.py, t.as_ref(self.py).getattr("__members__")).get_item(s)).into())
+      }
       Type::Sequence(typ) => Ok(PyList::new(self.py, deserializer.deserialize_seq(VisitSeq { py: self.py, typ })?).into()),
+      Type::List(typ) => Ok(PyList::new(self.py, deserializer.deserialize_seq(VisitSeq { py: self.py, typ })?).into()),
       Type::UniformTuple(typ) => Ok(PyTuple::new(self.py, deserializer.deserialize_seq(VisitSeq { py: self.py, typ })?).into()),
       Type::Set(typ) => Ok(pytry!(self.py, PySet::new(self.py, &deserializer.deserialize_seq(VisitSeq { py: self.py, typ })?)).into()),
       Type::FrozenSet(typ) => Ok(pytry!(self.py, PyFrozenSet::new(self.py, &deserializer.deserialize_seq(VisitSeq { py: self.py, typ })?)).into()),
