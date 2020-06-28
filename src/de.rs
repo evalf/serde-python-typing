@@ -1,28 +1,13 @@
 use pyo3::conversion::ToPyObject;
 use pyo3::exceptions::ValueError;
 use pyo3::types::{IntoPyDict, PyComplex, PyDict, PyFrozenSet, PyList, PySet, PyString, PyTuple};
-use pyo3::{PyErr, PyObject, Python, AsPyRef};
+use pyo3::{PyErr, PyObject, PyResult, Python, AsPyRef};
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::Type;
-
-// Like `?` for a `PyResult<T>` but if the result is an error, store the
-// error and return a serde error instead.
-macro_rules! pytry {
-  ($py:expr, $result:expr) => {
-    match $result {
-      Ok(v) => v,
-      Err(e) => {
-        let e: PyErr = e.into();
-        e.restore($py);
-        return Err(serde::de::Error::custom("python error"));
-      }
-    }
-  };
-}
 
 macro_rules! raise {
   ($py:expr, $exc:ty, $msg:expr) => {
@@ -47,16 +32,33 @@ fn strip_j(s: &str) -> Option<&str> {
   if s.ends_with('j') { Some(&s[..s.len()-1]) } else { None }
 }
 
+trait WrapPyErr<T> {
+  fn c<E: serde::de::Error>(self, py: Python) -> Result<T, E>;
+}
+
+impl<T, P: Into<PyErr>> WrapPyErr<T> for Result<T, P> {
+  fn c<E: serde::de::Error>(self, py: Python) -> Result<T, E> {
+    match self {
+      Ok(v) => Ok(v),
+      Err(e) => {
+        e.into().restore(py);
+        Err(serde::de::Error::custom("python error"))
+      }
+    }
+  }
+}
+
 impl<'de, 'a> DeserializeSeed<'de> for Wrapper<'a> {
   type Value = PyObject;
 
   fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+    let py = self.py;
     match self.typ {
-      Type::Str => deserializer.deserialize_str(VisitString(self.py)),
-      Type::Bytes => deserializer.deserialize_bytes(VisitBytes(self.py)),
-      Type::Bool => deserializer.deserialize_bool(VisitBool(self.py)),
-      Type::Int => deserializer.deserialize_i64(VisitInt(self.py)),
-      Type::Float => deserializer.deserialize_f64(VisitFloat(self.py)),
+      Type::Str => deserializer.deserialize_str(VisitString(py)),
+      Type::Bytes => deserializer.deserialize_bytes(VisitBytes(py)),
+      Type::Bool => deserializer.deserialize_bool(VisitBool(py)),
+      Type::Int => deserializer.deserialize_i64(VisitInt(py)),
+      Type::Float => deserializer.deserialize_f64(VisitFloat(py)),
       #[cfg(feature = "complex-str")]
       Type::Complex => {
         let mut parts = <&str>::deserialize(deserializer)?.split('+');
@@ -64,7 +66,7 @@ impl<'de, 'a> DeserializeSeed<'de> for Wrapper<'a> {
           (Some(r), Some(i), None) => match strip_j(i) {
             Some(i) => (r, i),
             None => {
-              raise!(self.py, ValueError, "cannot parse complex value");
+              raise!(py, ValueError, "cannot parse complex value");
             }
           },
           (Some(v), None, None) => match strip_j(v) {
@@ -72,45 +74,45 @@ impl<'de, 'a> DeserializeSeed<'de> for Wrapper<'a> {
             None => (v, "0"),
           },
           _ => {
-            raise!(self.py, ValueError, "cannot parse complex value");
+            raise!(py, ValueError, "cannot parse complex value");
           }
         };
         let r = match r.parse::<f64>() {
           Ok(v) => v,
           Err(e) => {
-            raise!(self.py, ValueError, format!("cannot parse complex value: {:?}", e));
+            raise!(py, ValueError, format!("cannot parse complex value: {:?}", e));
           }
         };
         let i = match i.parse::<f64>() {
           Ok(v) => v,
           Err(e) => {
-            raise!(self.py, ValueError, format!("cannot parse complex value: {:?}", e));
+            raise!(py, ValueError, format!("cannot parse complex value: {:?}", e));
           }
         };
-        Ok(PyComplex::from_doubles(self.py, r, i).into())
+        Ok(PyComplex::from_doubles(py, r, i).into())
       }
       #[cfg(feature = "complex-struct")]
       Type::Complex => {
         let val = Complex::deserialize(deserializer)?;
-        Ok(PyComplex::from_doubles(self.py, val.real, val.imag).into())
+        Ok(PyComplex::from_doubles(py, val.real, val.imag).into())
       }
       Type::Decimal => {
-        let s = deserializer.deserialize_str(VisitString(self.py))?;
-        Ok(pytry!(self.py, pytry!(self.py, pytry!(self.py, self.py.import("decimal")).getattr("Decimal")).call1((s,))).into())
+        let s = deserializer.deserialize_str(VisitString(py))?;
+        Ok(py.import("decimal").c(py)?.getattr("Decimal").c(py)?.call1((s,)).c(py)?.into())
       }
       Type::Enum(t) => {
-        let s = deserializer.deserialize_str(VisitString(self.py))?;
-        Ok(pytry!(self.py, pytry!(self.py, t.as_ref(self.py).getattr("__members__")).get_item(s)).into())
+        let s = deserializer.deserialize_str(VisitString(py))?;
+        Ok(t.as_ref(py).getattr("__members__").c(py)?.get_item(s).c(py)?.into())
       }
-      Type::Sequence(typ) => Ok(PyList::new(self.py, deserializer.deserialize_seq(VisitSeq { py: self.py, typ })?).into()),
-      Type::List(typ) => Ok(PyList::new(self.py, deserializer.deserialize_seq(VisitSeq { py: self.py, typ })?).into()),
-      Type::UniformTuple(typ) => Ok(PyTuple::new(self.py, deserializer.deserialize_seq(VisitSeq { py: self.py, typ })?).into()),
-      Type::Set(typ) => Ok(pytry!(self.py, PySet::new(self.py, &deserializer.deserialize_seq(VisitSeq { py: self.py, typ })?)).into()),
-      Type::FrozenSet(typ) => Ok(pytry!(self.py, PyFrozenSet::new(self.py, &deserializer.deserialize_seq(VisitSeq { py: self.py, typ })?)).into()),
-      Type::Tuple(typs) => deserializer.deserialize_seq(VisitTuple { py: self.py, typs: &typs }),
-      Type::Dict(ktyp, vtyp) => Ok(deserializer.deserialize_map(VisitMap { py: self.py, ktyp, vtyp })?.into_py_dict(self.py).into()),
-      Type::PositionalCallable(typs, callable) => Ok(pytry!(self.py, callable.call1(self.py, pytry!(self.py, deserializer.deserialize_seq(VisitTuple { py: self.py, typs: &typs })?.cast_as(self.py))))),
-      Type::KeywordCallable(typs, callable) => Ok(pytry!(self.py, callable.call(self.py, (), Some(deserializer.deserialize_map(VisitKwargs { py: self.py, typs: &typs })?.into_py_dict(self.py))))),
+      Type::Sequence(typ) => Ok(PyList::new(py, deserializer.deserialize_seq(VisitSeq { py: py, typ })?).into()),
+      Type::List(typ) => Ok(PyList::new(py, deserializer.deserialize_seq(VisitSeq { py: py, typ })?).into()),
+      Type::UniformTuple(typ) => Ok(PyTuple::new(py, deserializer.deserialize_seq(VisitSeq { py: py, typ })?).into()),
+      Type::Set(typ) => Ok(PySet::new(py, &deserializer.deserialize_seq(VisitSeq { py: py, typ })?).c(py)?.into()),
+      Type::FrozenSet(typ) => Ok(PyFrozenSet::new(py, &deserializer.deserialize_seq(VisitSeq { py: py, typ })?).c(py)?.into()),
+      Type::Tuple(typs) => deserializer.deserialize_seq(VisitTuple { py: py, typs: &typs }),
+      Type::Dict(ktyp, vtyp) => Ok(deserializer.deserialize_map(VisitMap { py: py, ktyp, vtyp })?.into_py_dict(py).into()),
+      Type::PositionalCallable(typs, callable) => Ok(callable.call1(py, deserializer.deserialize_seq(VisitTuple { py: py, typs: &typs })?.cast_as(py).c(py)?).c(py)?),
+      Type::KeywordCallable(typs, callable) => Ok(callable.call(py, (), Some(deserializer.deserialize_map(VisitKwargs { py: py, typs: &typs })?.into_py_dict(py))).c(py)?),
       _ => Err(serde::de::Error::custom("foo not implemented")),
     }
   }

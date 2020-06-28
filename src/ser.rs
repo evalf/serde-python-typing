@@ -7,19 +7,20 @@ use std::collections::BTreeMap;
 
 use crate::Type;
 
-// Like `?` for a `PyResult<T>` but if the result is an error, store the
-// error and return a serde error instead.
-macro_rules! pytry {
-  ($py:expr, $result:expr) => {
-    match $result {
-      Ok(v) => v,
+trait WrapPyErr<T> {
+  fn c<E: serde::ser::Error>(self, py: Python) -> Result<T, E>;
+}
+
+impl<T, P: Into<PyErr>> WrapPyErr<T> for Result<T, P> {
+  fn c<E: serde::ser::Error>(self, py: Python) -> Result<T, E> {
+    match self {
+      Ok(v) => Ok(v),
       Err(e) => {
-        let e: PyErr = e.into();
-        e.restore($py);
-        return Err(serde::ser::Error::custom("python error"));
+        e.into().restore(py);
+        Err(serde::ser::Error::custom("python error"))
       }
     }
-  };
+  }
 }
 
 macro_rules! raise {
@@ -39,10 +40,10 @@ macro_rules! raise_if {
 
 macro_rules! is_instance {
   ($py:expr, $val:expr, T:$typ:ty) => {
-    pytry!($py, $py.is_instance::<$typ, _>($val))
+    $py.is_instance::<$typ, _>($val).c($py)?
   };
   ($py:expr, $val:expr, O:$typ:expr) => {
-    pytry!($py, $typ.is_instance($val))
+    $typ.is_instance($val).c($py)?
   };
 }
 
@@ -115,8 +116,8 @@ fn serialize_seq<S: Serializer>(py: Python, serializer: S, seq: &PyAny, typ: &Ty
     Ok(len) => Some(len),
     Err(_) => None,
   })?;
-  for val in pytry!(py, seq.iter()) {
-    serseq.serialize_element(&Wrapper { py: py, typ, val: pytry!(py, val) })?;
+  for val in seq.iter().c(py)? {
+    serseq.serialize_element(&Wrapper { py: py, typ, val: val.c(py)? })?;
   }
   serseq.end()
 }
@@ -152,41 +153,42 @@ struct Complex {
 
 impl<'a> Serialize for Wrapper<'a> {
   fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    let py = self.py;
     match self.typ {
       Type::Str => {
-        check_is_instance!(self.py, self.val, T: PyString);
-        serializer.serialize_str(pytry!(self.py, self.val.extract()))
+        check_is_instance!(py, self.val, T: PyString);
+        serializer.serialize_str(self.val.extract().c(py)?)
       }
       Type::Bytes => {
-        check_is_instance!(self.py, self.val, T: PyBytes);
-        serializer.serialize_bytes(pytry!(self.py, self.val.extract()))
+        check_is_instance!(py, self.val, T: PyBytes);
+        serializer.serialize_bytes(self.val.extract().c(py)?)
       }
       Type::Bool => {
-        check_is_instance!(self.py, self.val, T: PyBool);
-        serializer.serialize_bool(pytry!(self.py, self.val.extract()))
+        check_is_instance!(py, self.val, T: PyBool);
+        serializer.serialize_bool(self.val.extract().c(py)?)
       }
       Type::Int => {
-        check_is_instance!(self.py, self.val, T: PyInt);
-        serializer.serialize_i64(pytry!(self.py, self.val.extract()))
+        check_is_instance!(py, self.val, T: PyInt);
+        serializer.serialize_i64(self.val.extract().c(py)?)
       }
-      Type::Float => serializer.serialize_f64(if is_instance!(self.py, self.val, T: PyFloat) {
-        pytry!(self.py, self.val.extract::<f64>())
-      } else if is_instance!(self.py, self.val, T: PyInt) {
-        pytry!(self.py, self.val.extract::<i64>()) as f64
+      Type::Float => serializer.serialize_f64(if is_instance!(py, self.val, T: PyFloat) {
+        self.val.extract::<f64>().c(py)?
+      } else if is_instance!(py, self.val, T: PyInt) {
+        self.val.extract::<i64>().c(py)? as f64
       } else {
-        raise!(self.py, ValueError, format!("expected an instance of `float` or `int` but got {}", get_type_name_or_question(self.val.get_type())));
+        raise!(py, ValueError, format!("expected an instance of `float` or `int` but got {}", get_type_name_or_question(self.val.get_type())));
       }),
       #[cfg(feature = "complex-str")]
       Type::Complex => {
-        let (r, i) = if is_instance!(self.py, self.val, T: PyComplex) {
-          let v: &PyComplex = pytry!(self.py, self.val.cast_as());
+        let (r, i) = if is_instance!(py, self.val, T: PyComplex) {
+          let v: &PyComplex = self.val.cast_as().c(py)?;
           (v.real(), v.imag())
-        } else if is_instance!(self.py, self.val, T: PyFloat) {
-          (pytry!(self.py, self.val.extract()), 0.0)
-        } else if is_instance!(self.py, self.val, T: PyInt) {
-          (pytry!(self.py, self.val.extract::<i64>()) as f64, 0.0)
+        } else if is_instance!(py, self.val, T: PyFloat) {
+          (self.val.extract().c(py)?, 0.0)
+        } else if is_instance!(py, self.val, T: PyInt) {
+          (self.val.extract::<i64>().c(py)? as f64, 0.0)
         } else {
-          raise!(self.py, ValueError, format!("expected an instance of `float` or `int` but got {}", get_type_name_or_question(self.val.get_type())));
+          raise!(py, ValueError, format!("expected an instance of `float` or `int` but got {}", get_type_name_or_question(self.val.get_type())));
         };
         serializer.serialize_str(&if i == 0.0 {
           format!("{}", r)
@@ -197,51 +199,51 @@ impl<'a> Serialize for Wrapper<'a> {
         })
       }
       #[cfg(feature = "complex-struct")]
-      Type::Complex => if is_instance!(self.py, self.val, T: PyComplex) {
-        let v: &PyComplex = pytry!(self.py, self.val.cast_as());
+      Type::Complex => if is_instance!(py, self.val, T: PyComplex) {
+        let v: &PyComplex = self.val.cast_as().c(py)?;
         Complex { real: v.real(), imag: v.imag() }
-      } else if is_instance!(self.py, self.val, T: PyFloat) {
-        Complex { real: pytry!(self.py, self.val.extract()), imag: 0.0 }
-      } else if is_instance!(self.py, self.val, T: PyInt) {
-        Complex { real: pytry!(self.py, self.val.extract::<i64>()) as f64, imag: 0.0 }
+      } else if is_instance!(py, self.val, T: PyFloat) {
+        Complex { real: self.val.extract().c(py)?, imag: 0.0 }
+      } else if is_instance!(py, self.val, T: PyInt) {
+        Complex { real: self.val.extract::<i64>().c(py)? as f64, imag: 0.0 }
       } else {
-        raise!(self.py, ValueError, format!("expected an instance of `float` or `int` but got {}", get_type_name_or_question(self.val.get_type())));
+        raise!(py, ValueError, format!("expected an instance of `float` or `int` but got {}", get_type_name_or_question(self.val.get_type())));
       }
       .serialize(serializer),
       Type::Decimal => {
-        let m = pytry!(self.py, self.py.import("decimal"));
-        let decimal: &PyType = pytry!(self.py, pytry!(self.py, m.getattr("Decimal")).cast_as());
-        check_is_instance!(self.py, self.val, O:decimal);
-        serializer.serialize_str(pytry!(self.py, pytry!(self.py, self.val.str()).extract()))
+        let m = py.import("decimal").c(py)?;
+        let decimal: &PyType = m.getattr("Decimal").c(py)?.cast_as().c(py)?;
+        check_is_instance!(py, self.val, O:decimal);
+        serializer.serialize_str(self.val.str().c(py)?.extract().c(py)?)
       }
       Type::Enum(t) => {
-        check_is_instance!(self.py, self.val, O:t.as_ref(self.py));
-        serializer.serialize_str(pytry!(self.py, pytry!(self.py, self.val.getattr("name")).extract()))
+        check_is_instance!(py, self.val, O:t.as_ref(py));
+        serializer.serialize_str(self.val.getattr("name").c(py)?.extract().c(py)?)
       }
-      Type::Sequence(typ) => serialize_seq(self.py, serializer, self.val, typ),
+      Type::Sequence(typ) => serialize_seq(py, serializer, self.val, typ),
       Type::List(typ) => {
-        check_is_instance!(self.py, self.val, T: PyList);
-        serialize_seq(self.py, serializer, self.val, typ)
+        check_is_instance!(py, self.val, T: PyList);
+        serialize_seq(py, serializer, self.val, typ)
       }
       Type::UniformTuple(typ) => {
-        check_is_instance!(self.py, self.val, T: PyTuple);
-        serialize_seq(self.py, serializer, self.val, typ)
+        check_is_instance!(py, self.val, T: PyTuple);
+        serialize_seq(py, serializer, self.val, typ)
       }
       Type::Set(typ) => {
-        check_is_instance!(self.py, self.val, T: PySet);
-        serialize_seq(self.py, serializer, self.val, typ)
+        check_is_instance!(py, self.val, T: PySet);
+        serialize_seq(py, serializer, self.val, typ)
       }
       Type::FrozenSet(typ) => {
-        check_is_instance!(self.py, self.val, T: PyFrozenSet);
-        serialize_seq(self.py, serializer, self.val, typ)
+        check_is_instance!(py, self.val, T: PyFrozenSet);
+        serialize_seq(py, serializer, self.val, typ)
       }
       Type::Tuple(typs) => {
-        check_is_instance!(self.py, self.val, T: PyTuple);
-        let val_len = pytry!(self.py, self.val.len());
-        raise_if!(val_len != typs.len(), self.py, ValueError, format!("expected a `tuple` of length {} but got {}", typs.len(), val_len));
+        check_is_instance!(py, self.val, T: PyTuple);
+        let val_len = self.val.len().c(py)?;
+        raise_if!(val_len != typs.len(), py, ValueError, format!("expected a `tuple` of length {} but got {}", typs.len(), val_len));
         let mut sertup = serializer.serialize_seq(Some(typs.len()))?;
-        for (typ, val) in typs.iter().zip(pytry!(self.py, self.val.iter())) {
-          sertup.serialize_element(&Wrapper { py: self.py, typ, val: pytry!(self.py, val) })?;
+        for (typ, val) in typs.iter().zip(self.val.iter().c(py)?) {
+          sertup.serialize_element(&Wrapper { py: py, typ, val: val.c(py)? })?;
         }
         sertup.end()
       }
@@ -250,41 +252,41 @@ impl<'a> Serialize for Wrapper<'a> {
           Ok(len) => Some(len),
           Err(_) => None,
         })?;
-        for item in pytry!(self.py, pytry!(self.py, self.val.call_method0("items")).iter()) {
-          let item = pytry!(self.py, item);
-          let item_len = pytry!(self.py, item.len());
-          raise_if!(item_len < 2, self.py, ValueError, format!("not enough values to unpack (expected 2, got {})", item_len));
-          raise_if!(item_len > 2, self.py, ValueError, format!("too many values to unpack (expected 2)"));
-          sermap.serialize_entry(&Wrapper { py: self.py, typ: ktyp, val: pytry!(self.py, item.get_item(0)) }, &Wrapper { py: self.py, typ: vtyp, val: pytry!(self.py, item.get_item(1)) })?;
+        for item in self.val.call_method0("items").c(py)?.iter().c(py)? {
+          let item = item.c(py)?;
+          let item_len = item.len().c(py)?;
+          raise_if!(item_len < 2, py, ValueError, format!("not enough values to unpack (expected 2, got {})", item_len));
+          raise_if!(item_len > 2, py, ValueError, format!("too many values to unpack (expected 2)"));
+          sermap.serialize_entry(&Wrapper { py: py, typ: ktyp, val: item.get_item(0).c(py)? }, &Wrapper { py: py, typ: vtyp, val: item.get_item(1).c(py)? })?;
         }
         sermap.end()
       }
       Type::PositionalCallable(typs, callable) => {
-        let obj: &PyAny = callable.as_ref(self.py);
-        raise_if!(!is_instance!(self.py, obj.get_type(), T: PyType), self.py, ValueError, "only types can be serialized");
-        let obj: &PyType = pytry!(self.py, obj.cast_as::<PyType>());
-        check_is_instance!(self.py, self.val, O: obj);
-        let args: Vec<&PyAny> = pytry!(self.py, pytry!(self.py, self.val.call_method0("__getnewargs__")).extract());
+        let obj: &PyAny = callable.as_ref(py);
+        raise_if!(!is_instance!(py, obj.get_type(), T: PyType), py, ValueError, "only types can be serialized");
+        let obj: &PyType = obj.cast_as::<PyType>().c(py)?;
+        check_is_instance!(py, self.val, O: obj);
+        let args: Vec<&PyAny> = self.val.call_method0("__getnewargs__").c(py)?.extract().c(py)?;
         if args.len() != typs.len() {
-          raise!(self.py, ValueError, format!("__getnewargs__ returned {} args but {} were expected", args.len(), typs.len()));
+          raise!(py, ValueError, format!("__getnewargs__ returned {} args but {} were expected", args.len(), typs.len()));
         }
         let mut sertup = serializer.serialize_seq(Some(typs.len()))?;
-        typs.iter().zip(args).try_for_each(|(typ, val)| sertup.serialize_element(&Wrapper { py: self.py, typ, val }))?;
+        typs.iter().zip(args).try_for_each(|(typ, val)| sertup.serialize_element(&Wrapper { py: py, typ, val }))?;
         sertup.end()
       }
       Type::KeywordCallable(typs, callable) => {
-        let obj: &PyAny = callable.as_ref(self.py);
-        raise_if!(!is_instance!(self.py, obj.get_type(), T: PyType), self.py, ValueError, "only types can be serialized");
-        let obj: &PyType = pytry!(self.py, obj.cast_as::<PyType>());
-        check_is_instance!(self.py, self.val, O: obj);
+        let obj: &PyAny = callable.as_ref(py);
+        raise_if!(!is_instance!(py, obj.get_type(), T: PyType), py, ValueError, "only types can be serialized");
+        let obj: &PyType = obj.cast_as::<PyType>().c(py)?;
+        check_is_instance!(py, self.val, O: obj);
         let (args, kwargs): (Vec<&PyAny>, BTreeMap<String, &PyAny>) = if let Ok(result) = self.val.call_method0("__getnewargs__") {
-          (pytry!(self.py, result.extract()), BTreeMap::new())
+          (result.extract().c(py)?, BTreeMap::new())
         } else if let Ok(result) = self.val.call_method0("__getnewargs_ex__") {
-          pytry!(self.py, result.extract())
-        } else if pytry!(self.py, is_dataclass(self.py, self.val)) {
-          (Vec::new(), typs.iter().map(|(name, _typ)| Ok((name.to_owned(), pytry!(self.py, self.val.getattr(name))))).collect::<Result<_, S::Error>>()?)
+          result.extract().c(py)?
+        } else if is_dataclass(py, self.val).c(py)? {
+          (Vec::new(), typs.iter().map(|(name, _typ)| Ok((name.to_owned(), self.val.getattr(name).c(py)?))).collect::<Result<_, S::Error>>()?)
         } else {
-          raise!(self.py, ValueError, format!("cannot call `__getnewargs__` or `__getnewargs_ex__`"));
+          raise!(py, ValueError, format!("cannot call `__getnewargs__` or `__getnewargs_ex__`"));
         };
         let mut args = args.iter();
         let mut sermap = serializer.serialize_map(Some(typs.len()))?;
@@ -294,9 +296,9 @@ impl<'a> Serialize for Wrapper<'a> {
           } else if let Some(arg) = kwargs.get(name) {
             arg
           } else {
-            raise!(self.py, ValueError, format!("cannot find argument {}", name));
+            raise!(py, ValueError, format!("cannot find argument {}", name));
           };
-          sermap.serialize_entry(name, &Wrapper { py: self.py, typ, val })?;
+          sermap.serialize_entry(name, &Wrapper { py: py, typ, val })?;
         }
         sermap.end()
       }
