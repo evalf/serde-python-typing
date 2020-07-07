@@ -12,7 +12,6 @@ readme = "README.md"
 
 [features]
 complex-str = []
-complex-struct = []
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
