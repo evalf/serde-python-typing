@@ -175,28 +175,28 @@ impl<'py> Globals<'py> {
   }
 }
 
-pub enum WrappedError<E> {
+pub enum DualError<E> {
   Python(PyErr),
-  Other(E),
+  Serialization(E),
 }
 
-pub type WrappedResult<T, E> = Result<T, WrappedError<E>>;
+pub type DualResult<T, E> = Result<T, DualError<E>>;
 
-impl<P: Into<PyErr>, E> From<P> for WrappedError<E> {
+impl<P: Into<PyErr>, E> From<P> for DualError<E> {
   fn from(v: P) -> Self {
     Self::Python(v.into())
   }
 }
 
 pub trait Wrap<T, E> {
-  fn wrap(self) -> WrappedResult<T, E>;
+  fn wrap(self) -> DualResult<T, E>;
 }
 
 impl<T, E> Wrap<T, E> for Result<T, E> {
-  fn wrap(self) -> WrappedResult<T, E> {
+  fn wrap(self) -> DualResult<T, E> {
     match self {
       Ok(v) => Ok(v),
-      Err(e) => Err(WrappedError::Other(e)),
+      Err(e) => Err(DualError::Serialization(e)),
     }
   }
 }
@@ -219,8 +219,8 @@ where
       }
     }
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error>;
-  fn serialize<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error>;
+  fn serialize<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     if self.is_instance(py, value, Some(0))? {
       self.serialize_checked(serializer, py, value)
     } else {
@@ -228,14 +228,14 @@ where
         Ok(s) => format!("`{}`", s.to_string_lossy()),
         Err(_) => "?".to_string(),
       };
-      Err(ValueError::py_err(format!("expected an instance of `{}` but got an instance of {}", self, got_type_str)).into())
+      Err(ser::Error::custom(format!("expected an instance of `{}` but got an instance of {}", self, got_type_str))).wrap()
     }
   }
-  fn serialize_variant<S: Serializer>(&self, serializer: S, py: Python, name: &'static str, variant_index: u32, variant: &'static str, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_variant<S: Serializer>(&self, serializer: S, py: Python, name: &'static str, variant_index: u32, variant: &'static str, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     serializer.serialize_newtype_variant(name, variant_index, variant, &PySerialize::new(py, self, value)).wrap()
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error>;
-  fn deserialize_variant<'de, A: VariantAccess<'de>>(&self, access: A, py: Python) -> WrappedResult<PyObject, A::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error>;
+  fn deserialize_variant<'de, A: VariantAccess<'de>>(&self, access: A, py: Python) -> DualResult<PyObject, A::Error> {
     access.newtype_variant_seed(PyDeserialize::new(py, self)).wrap()
   }
 }
@@ -259,10 +259,10 @@ impl TypeFuncs for NoneType {
   fn is_instance_children(&self, _py: Python, _value: &PyAny, _depth: Option<usize>) -> PyResult<bool> {
     Ok(true)
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, _py: Python, _value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, _py: Python, _value: &PyAny) -> DualResult<S::Ok, S::Error> {
     serializer.serialize_unit().wrap()
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     struct PyVisitor<'py>(Python<'py>);
 
     impl<'de, 'py> Visitor<'de> for PyVisitor<'py> {
@@ -298,10 +298,10 @@ macro_rules! mk_simple_type {
       fn is_instance_children(&self, _py: Python, _value: &PyAny, _depth: Option<usize>) -> PyResult<bool> {
         Ok(true)
       }
-      fn serialize_checked<S: Serializer>(&self, serializer: S, _py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+      fn serialize_checked<S: Serializer>(&self, serializer: S, _py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
         serializer.$serialize(value.extract()?).wrap()
       }
-      fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+      fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
         struct PyVisitor<'py>(Python<'py>);
 
         impl<'de, 'py> Visitor<'de> for PyVisitor<'py> {
@@ -352,7 +352,7 @@ impl TypeFuncs for Complex {
   fn is_instance_children(&self, _py: Python, _value: &PyAny, _depth: Option<usize>) -> PyResult<bool> {
     Ok(true)
   }
-  fn serialize<S: Serializer>(&self, serializer: S, _py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize<S: Serializer>(&self, serializer: S, _py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     let ri = if let Ok(v) = value.cast_as::<PyComplex>() {
       (v.real(), v.imag())
     } else if let Ok(v) = value.cast_as::<PyFloat>() {
@@ -364,7 +364,7 @@ impl TypeFuncs for Complex {
         Ok(s) => format!("`{}`", s.to_string_lossy()),
         Err(_) => "?".to_string(),
       };
-      return Err(ValueError::py_err(format!("expected an instance of `{}` but got an instance of {}", self, got_type_str)).into());
+      return Err(ser::Error::custom(format!("expected an instance of `{}` but got an instance of {}", self, got_type_str))).wrap();
     };
     #[cfg(feature = "complex-str")]
     let ri = &if ri.1 == 0.0 {
@@ -376,10 +376,10 @@ impl TypeFuncs for Complex {
     };
     ri.serialize(serializer).wrap()
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     self.serialize(serializer, py, value)
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     #[cfg(feature = "complex-str")]
     let (r, i) = {
       fn strip_j(s: &str) -> Option<&str> {
@@ -389,12 +389,13 @@ impl TypeFuncs for Complex {
           None
         }
       }
-      let mut parts = <&str>::deserialize(deserializer).wrap()?.split('+');
+      let strval: &str = <&str>::deserialize(deserializer).wrap()?;
+      let mut parts = strval.split('+');
       let (r, i) = match (parts.next(), parts.next(), parts.next()) {
         (Some(r), Some(i), None) => match strip_j(i) {
           Some(i) => (r, i),
           None => {
-            return Err(ValueError::py_err("cannot parse complex value"))?;
+            return Err(de::Error::invalid_value(de::Unexpected::Other(strval), &"a complex value")).wrap();
           }
         },
         (Some(v), None, None) => match strip_j(v) {
@@ -402,19 +403,19 @@ impl TypeFuncs for Complex {
           None => (v, "0"),
         },
         _ => {
-          return Err(ValueError::py_err("cannot parse complex value"))?;
+          return Err(de::Error::invalid_value(de::Unexpected::Other(strval), &"a complex value")).wrap();
         }
       };
       let r = match r.parse::<f64>() {
         Ok(v) => v,
         Err(_e) => {
-          return Err(ValueError::py_err("cannot parse complex value"))?;
+          return Err(de::Error::invalid_value(de::Unexpected::Other(strval), &"a complex value")).wrap();
         }
       };
       let i = match i.parse::<f64>() {
         Ok(v) => v,
         Err(_e) => {
-          return Err(ValueError::py_err("cannot parse complex value"))?;
+          return Err(de::Error::invalid_value(de::Unexpected::Other(strval), &"a complex value")).wrap();
         }
       };
       (r, i)
@@ -444,10 +445,10 @@ impl<'a> TypeFuncs for Decimal {
   fn is_instance_children(&self, _py: Python, _value: &PyAny, _depth: Option<usize>) -> PyResult<bool> {
     Ok(true)
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, _py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, _py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     value.str()?.extract::<&str>()?.serialize(serializer).wrap()
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     let value: &str = Deserialize::deserialize(deserializer).wrap()?;
     Ok(self.0.as_ref(py).call1((value,))?.into())
   }
@@ -496,7 +497,7 @@ impl TypeFuncs for Sequence {
   fn is_instance_children(&self, py: Python, value: &PyAny, depth: Option<usize>) -> PyResult<bool> {
     value.iter()?.try_all(|item| self.elem_type.is_instance(py, item?, depth))
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     let mut seq = serializer
       .serialize_seq(match value.len() {
         Ok(len) => Some(len),
@@ -508,7 +509,7 @@ impl TypeFuncs for Sequence {
     }
     seq.end().wrap()
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     struct PyVisitor<'py, 'a> {
       py: Python<'py>,
       elem_type: &'a Type,
@@ -567,14 +568,14 @@ impl TypeFuncs for Tuple {
   fn is_instance_children(&self, py: Python, value: &PyAny, depth: Option<usize>) -> PyResult<bool> {
     self.0.iter().zip(value.iter()?).try_all(|(ty, val)| ty.is_instance(py, val?, depth))
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     let mut ser = serializer.serialize_seq(Some(self.0.len())).wrap()?;
     for (elem_type, elem) in self.0.iter().zip(value.iter()?) {
       ser.serialize_element(&PySerialize::new(py, elem_type, elem?)).wrap()?;
     }
     ser.end().wrap()
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     struct PyVisitor<'py, 'a> {
       py: Python<'py>,
       elem_types: &'a Vec<Type>,
@@ -592,8 +593,7 @@ impl TypeFuncs for Tuple {
           match seq.next_element_seed(PyDeserialize::new(self.py, elem_type))? {
             Some(elem) => result.push(elem),
             None => {
-              ValueError::py_err("too few elements").restore(self.py);
-              return Err(de::Error::custom("python error"));
+              return Err(de::Error::invalid_length(result.len(), &format!("a sequence of length {}", self.elem_types.len()).as_str()));
             }
           };
         }
@@ -674,16 +674,16 @@ impl TypeFuncs for Enum {
   fn is_instance_children(&self, _py: Python, _value: &PyAny, _depth: Option<usize>) -> PyResult<bool> {
     Ok(true)
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, _py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, _py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     let variant = value.getattr("name")?.extract()?;
     if let Some((index, _)) = self.variants.iter().enumerate().find(|(_, v)| v == &variant) {
       let strings = as_static_strings(&[&self.name, variant]);
       serializer.serialize_unit_variant(strings[0], index as u32, strings[1]).wrap()
     } else {
-      Err(ValueError::py_err(format!("unexpected variant for enum {}: {}", self.name, variant)))?
+      Err(ser::Error::custom(format!("unexpected variant for enum {}: {}", self.name, variant))).wrap()
     }
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     struct EnumVisitor(&'static [&'static str]);
 
     impl<'de> Visitor<'de> for EnumVisitor {
@@ -748,14 +748,14 @@ impl TypeFuncs for Optional {
       self.0.is_instance(py, value, depth)
     }
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     if value.is_none() {
       serializer.serialize_none().wrap()
     } else {
       serializer.serialize_some(&PySerialize::new(py, &*self.0, value)).wrap()
     }
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     struct PyVisitor<'py, 'a> {
       py: Python<'py>,
       some_type: &'a Type,
@@ -819,16 +819,16 @@ impl TypeFuncs for Union {
   fn is_instance_children(&self, py: Python, value: &PyAny, _depth: Option<usize>) -> PyResult<bool> {
     self.0.iter().try_any(|(_name, ty)| ty.is_instance(py, value, _depth))
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     for (variant_index, (variant_name, ty)) in (&self.0).iter().enumerate() {
       if ty.is_instance(py, value, Some(0))? {
         let strings = as_static_strings(&["anonymous", &variant_name]);
         return ty.serialize_variant(serializer, py, strings[0], variant_index as u32, strings[1], value);
       }
     }
-    Err(ValueError::py_err("unknown variant"))?
+    Err(ser::Error::custom("unknown variant")).wrap()
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     struct EnumVisitor<'py, 'a> {
       py: Python<'py>,
       variants: &'a Vec<(String, Type)>,
@@ -843,18 +843,14 @@ impl TypeFuncs for Union {
       }
       fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Self::Value, A::Error> {
         let (index, access) = data.variant_seed(VariantIndex(self.static_variants))?;
-        if let Some((_name, ty)) = self.variants.get(index as usize) {
-          match ty.deserialize_variant(access, self.py) {
-            Ok(v) => Ok(v),
-            Err(WrappedError::Other(e)) => Err(e),
-            Err(WrappedError::Python(e)) => {
-              e.restore(self.py);
-              Err(de::Error::custom("python error"))
-            }
+        let (_name, ty) = self.variants.get(index as usize).unwrap(); // bounds checked by `data.variant_seed`
+        match ty.deserialize_variant(access, self.py) {
+          Ok(v) => Ok(v),
+          Err(DualError::Serialization(e)) => Err(e),
+          Err(DualError::Python(e)) => {
+            e.restore(self.py);
+            Err(de::Error::custom("python error"))
           }
-        } else {
-          ValueError::py_err("unknown variant").restore(self.py);
-          Err(de::Error::custom("python error"))
         }
       }
     }
@@ -921,7 +917,7 @@ impl TypeFuncs for Mapping {
     }
     Ok(true)
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     let mut ser = serializer.serialize_map(match value.len() {
       Ok(len) => Some(len),
       Err(_) => None,
@@ -929,13 +925,13 @@ impl TypeFuncs for Mapping {
     for item in value.call_method0("items")?.iter()? {
       let item = item?;
       if item.len()? != 2 {
-        return Err(ValueError::py_err(format!("invalid number of values to unpack (expected 2, got {})", item.len()?)))?;
+        return Err(ser::Error::custom(format!("invalid number of values to unpack (expected 2, got {})", item.len()?))).wrap();
       }
       ser.serialize_entry(&PySerialize::new(py, &*self.key_type, item.get_item(0)?), &PySerialize::new(py, &*self.value_type, item.get_item(1)?)).wrap()?;
     }
     ser.end().wrap()
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     struct VisitMap<'py, 'a> {
       py: Python<'py>,
       key_type: &'a Type,
@@ -1003,7 +999,7 @@ impl TypeFuncs for CallableKeywords {
   fn is_instance_children(&self, _py: Python, _value: &PyAny, _depth: Option<usize>) -> PyResult<bool> {
     Err(ValueError::py_err("not implemented"))
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     let (args, kwargs): (Vec<&PyAny>, BTreeMap<String, &PyAny>) = if let Ok(result) = value.call_method0("__getnewargs__") {
       (result.extract()?, BTreeMap::new())
     } else if let Ok(result) = value.call_method0("__getnewargs_ex__") {
@@ -1011,7 +1007,7 @@ impl TypeFuncs for CallableKeywords {
     } else if py.import("dataclasses")?.getattr("is_dataclass")?.call1((value,))?.extract()? {
       (Vec::new(), self.parameters.iter().map(|(name, _typ)| Ok((name.to_owned(), value.getattr(name)?))).collect::<PyResult<_>>()?)
     } else {
-      return Err(ValueError::py_err("cannot call `__getnewargs__` or `__getnewargs_ex__`"))?;
+      return Err(ser::Error::custom("cannot call `__getnewargs__` or `__getnewargs_ex__`")).wrap();
     };
     let mut args = args.iter();
     let mut ser = serializer.serialize_map(Some(self.parameters.len())).wrap()?;
@@ -1021,13 +1017,13 @@ impl TypeFuncs for CallableKeywords {
       } else if let Some(arg) = kwargs.get(name) {
         arg
       } else {
-        return Err(ValueError::py_err(format!("cannot find argument {}", name)))?;
+        return Err(ser::Error::custom(format!("cannot find argument {}", name))).wrap();
       };
       ser.serialize_entry(&name, &PySerialize::new(py, typ, val)).wrap()?;
     }
     ser.end().wrap()
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     struct VisitKwargs<'py, 'a> {
       py: Python<'py>,
       parameters: &'a Vec<(String, Type)>,
@@ -1046,8 +1042,7 @@ impl TypeFuncs for CallableKeywords {
           if let Some(typ) = parameters.remove(&key) {
             v.push((key.to_object(self.py), map.next_value_seed(PyDeserialize::new(self.py, typ))?));
           } else {
-            ValueError::py_err(format!("unexpected argument {}", key)).restore(self.py);
-            return Err(de::Error::custom("python error"));
+            return Err(de::Error::invalid_value(de::Unexpected::Other(key), &"unexpected argument"));
           }
         }
         Ok(v)
@@ -1103,14 +1098,14 @@ impl TypeFuncs for CallablePositional {
   fn is_instance_children(&self, _py: Python, _value: &PyAny, _depth: Option<usize>) -> PyResult<bool> {
     Err(ValueError::py_err("not implemented"))
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     let args: Vec<&PyAny> = if let Ok(result) = value.call_method0("__getnewargs__") {
       result.extract()?
     } else {
-      return Err(ValueError::py_err("cannot call `__getnewargs__`"))?;
+      return Err(ser::Error::custom("cannot call `__getnewargs__`")).wrap();
     };
     if args.len() != self.parameters.len() {
-      return Err(ValueError::py_err(format!("expected {} arguments but got {}", self.parameters.len(), args.len())))?;
+      return Err(ser::Error::custom(format!("expected {} arguments but got {}", self.parameters.len(), args.len()))).wrap();
     }
     let mut ser = serializer.serialize_seq(Some(self.parameters.len())).wrap()?;
     for (ty, arg) in self.parameters.iter().zip(args) {
@@ -1118,7 +1113,7 @@ impl TypeFuncs for CallablePositional {
     }
     ser.end().wrap()
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     struct VisitArgs<'py, 'a> {
       py: Python<'py>,
       parameters: &'a Vec<Type>,
@@ -1136,8 +1131,7 @@ impl TypeFuncs for CallablePositional {
           if let Some(elem) = seq.next_element_seed(PyDeserialize::new(self.py, ty))? {
             v.push(elem)
           } else {
-            ValueError::py_err("unexpected end of sequence").restore(self.py);
-            return Err(de::Error::custom("python error"));
+            return Err(de::Error::invalid_length(v.len(), &format!("a sequence of length {}", self.parameters.len()).as_str()));
           }
         }
         Ok(v)
@@ -1191,19 +1185,19 @@ impl TypeFuncs for Type {
   fn is_instance(&self, py: Python, value: &PyAny, depth: Option<usize>) -> PyResult<bool> {
     dispatch_variants!(self.is_instance(py, value, depth))
   }
-  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_checked<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     dispatch_variants!(self.serialize_checked(serializer, py, value))
   }
-  fn serialize<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize<S: Serializer>(&self, serializer: S, py: Python, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     dispatch_variants!(self.serialize(serializer, py, value))
   }
-  fn serialize_variant<S: Serializer>(&self, serializer: S, py: Python, name: &'static str, variant_index: u32, variant: &'static str, value: &PyAny) -> WrappedResult<S::Ok, S::Error> {
+  fn serialize_variant<S: Serializer>(&self, serializer: S, py: Python, name: &'static str, variant_index: u32, variant: &'static str, value: &PyAny) -> DualResult<S::Ok, S::Error> {
     dispatch_variants!(self.serialize_variant(serializer, py, name, variant_index, variant, value))
   }
-  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> WrappedResult<PyObject, D::Error> {
+  fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> DualResult<PyObject, D::Error> {
     dispatch_variants!(self.deserialize(deserializer, py))
   }
-  fn deserialize_variant<'de, A: VariantAccess<'de>>(&self, access: A, py: Python) -> WrappedResult<PyObject, A::Error> {
+  fn deserialize_variant<'de, A: VariantAccess<'de>>(&self, access: A, py: Python) -> DualResult<PyObject, A::Error> {
     dispatch_variants!(self.deserialize_variant(access, py))
   }
 }
@@ -1233,8 +1227,8 @@ impl<'py, 'a, T: TypeFuncs> Serialize for PySerialize<'py, 'a, T> {
   fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
     match self.ty.serialize(serializer, self.py, self.val) {
       Ok(v) => Ok(v),
-      Err(WrappedError::Other(e)) => Err(e),
-      Err(WrappedError::Python(e)) => {
+      Err(DualError::Serialization(e)) => Err(e),
+      Err(DualError::Python(e)) => {
         e.restore(self.py);
         Err(ser::Error::custom("python error"))
       }
@@ -1259,8 +1253,8 @@ impl<'de, 'py, 'a, T: TypeFuncs> DeserializeSeed<'de> for PyDeserialize<'py, 'a,
   fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
     match self.ty.deserialize(deserializer, self.py) {
       Ok(v) => Ok(v),
-      Err(WrappedError::Other(e)) => Err(e),
-      Err(WrappedError::Python(e)) => {
+      Err(DualError::Serialization(e)) => Err(e),
+      Err(DualError::Python(e)) => {
         e.restore(self.py);
         Err(de::Error::custom("python error"))
       }

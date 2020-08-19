@@ -1,6 +1,5 @@
 mod types;
 
-use pyo3::exceptions::ValueError;
 use pyo3::types::PyAny;
 use pyo3::{PyErr, PyNativeType, PyObject, PyResult, Python};
 use serde::de::DeserializeSeed;
@@ -10,6 +9,7 @@ use std::fmt;
 use types::{PyDeserialize, PySerialize, Globals, TypeFuncs};
 
 pub struct Type(types::Type);
+pub use types::DualError;
 
 impl Type {
   pub fn from_python(pytype: &PyAny) -> PyResult<Self> {
@@ -18,11 +18,11 @@ impl Type {
   pub fn is_instance(&self, value: &PyAny) -> PyResult<bool> {
     self.0.is_instance(value.py(), value, None)
   }
-  pub fn serialize<S: Serializer>(&self, serializer: S, value: &PyAny) -> PyResult<S::Ok> {
+  pub fn serialize<S: Serializer>(&self, serializer: S, value: &PyAny) -> Result<S::Ok, DualError<S::Error>> {
     let py = value.py();
     wrap_err(py, PySerialize::new(py, &self.0, value).serialize(serializer))
   }
-  pub fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> PyResult<PyObject> {
+  pub fn deserialize<'de, D: Deserializer<'de>>(&self, deserializer: D, py: Python) -> Result<PyObject, DualError<D::Error>> {
     wrap_err(py, PyDeserialize::new(py, &self.0).deserialize(deserializer))
   }
 }
@@ -33,9 +33,9 @@ impl fmt::Display for Type {
   }
 }
 
-pub fn wrap_err<T, E: fmt::Display>(py: Python, r: Result<T, E>) -> PyResult<T> {
+fn wrap_err<T, E>(py: Python, r: Result<T, E>) -> Result<T, DualError<E>> {
   match r {
     Ok(v) => Ok(v),
-    Err(e) => Err(if PyErr::occurred(py) { PyErr::fetch(py) } else { ValueError::py_err(e.to_string()) }),
+    Err(e) => Err(if PyErr::occurred(py) { DualError::Python(PyErr::fetch(py)) } else { DualError::Serialization(e) }),
   }
 }
